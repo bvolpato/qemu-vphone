@@ -34,6 +34,12 @@
 #define MSIX_ENABLE_MASK (PCI_MSIX_FLAGS_ENABLE >> 8)
 #define MSIX_MASKALL_MASK (PCI_MSIX_FLAGS_MASKALL >> 8)
 
+static bool msix_trace_vusb_device(PCIDevice *dev)
+{
+    /* Keep optional diagnostics confined to the stable VUSB PCI QOM type. */
+    return !strcmp(object_get_typename(OBJECT(dev)), "vresearch-vusb-pci");
+}
+
 static MSIMessage msix_prepare_message(PCIDevice *dev, unsigned vector)
 {
     uint8_t *table_entry = dev->msix_table + vector * PCI_MSIX_ENTRY_SIZE;
@@ -142,6 +148,10 @@ static void msix_handle_mask_update(PCIDevice *dev, int vector, bool was_masked)
 
     if (!is_masked && msix_is_pending(dev, vector)) {
         msix_clr_pending(dev, vector);
+        if (trace_event_get_state_backends(TRACE_VUSB_MSIX_PENDING_REPLAY) &&
+            msix_trace_vusb_device(dev)) {
+            trace_vusb_msix_pending_replay(g_get_monotonic_time(), vector);
+        }
         msix_notify(dev, vector);
     }
 }
@@ -544,17 +554,32 @@ void msix_notify(PCIDevice *dev, unsigned vector)
     assert(vector < dev->msix_entries_nr);
 
     if (!dev->msix_entry_used[vector]) {
+        if (trace_event_get_state_backends(TRACE_VUSB_MSIX_NOTIFY) &&
+            msix_trace_vusb_device(dev)) {
+            trace_vusb_msix_notify(g_get_monotonic_time(), vector,
+                                  false, -1, "unused");
+        }
         return;
     }
 
     if (msix_is_masked(dev, vector)) {
         msix_set_pending(dev, vector);
+        if (trace_event_get_state_backends(TRACE_VUSB_MSIX_NOTIFY) &&
+            msix_trace_vusb_device(dev)) {
+            trace_vusb_msix_notify(g_get_monotonic_time(), vector,
+                                  true, 1, "pending-set");
+        }
         return;
     }
 
     msg = msix_get_message(dev, vector);
 
     msi_send_message(dev, msg);
+    if (trace_event_get_state_backends(TRACE_VUSB_MSIX_NOTIFY) &&
+        msix_trace_vusb_device(dev)) {
+        trace_vusb_msix_notify(g_get_monotonic_time(), vector,
+                              true, 0, "send-returned");
+    }
 }
 
 void msix_reset(PCIDevice *dev)
