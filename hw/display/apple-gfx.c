@@ -84,7 +84,6 @@ static int apple_gfx_do_render(void *opaque)
         rvg_frame_commit(frame);
         rvg_frame_wait(frame);
         rvg_frame_release(frame);
-        job->pixels = g_malloc(stride * job->height);
         status = rvg_frame_target_read_pixels(job->target, job->pixels, stride,
                                               stride * job->height);
         if (status != RVG_OK) {
@@ -111,12 +110,13 @@ static int apple_gfx_do_render(void *opaque)
 
 /*
  * Whether the surface follows the guest's frames as they come: a display
- * change listener asked for it lately, and the display has no window of its
- * own. Otherwise it is drawn only when gfx_update asks for it.
+ * change listener is attached and asked for it lately, and the display has no
+ * window of its own. Otherwise it is drawn only when gfx_update asks for it.
  */
 static bool apple_gfx_watched(AppleGFXDisplay *d)
 {
     return !d->state->window &&
+           qemu_console_is_visible(d->con) &&
            qemu_clock_get_ms(QEMU_CLOCK_REALTIME) < d->watched_until_ms;
 }
 
@@ -128,6 +128,8 @@ static bool apple_gfx_watched(AppleGFXDisplay *d)
 static bool apple_gfx_render_new_frame(AppleGFXDisplay *d)
 {
     AppleGFXRenderJob *job;
+    uint32_t width, height;
+    size_t buf_size;
 
     assert(bql_locked());
     if (d->rendering) {
@@ -136,14 +138,24 @@ static bool apple_gfx_render_new_frame(AppleGFXDisplay *d)
     if (!d->frame_dirty || d->surface == NULL || d->target == NULL) {
         return false;
     }
+    width = surface_width(d->surface);
+    height = surface_height(d->surface);
+    buf_size = (size_t)width * 4 * height;
+    if (d->readback_buf_size != buf_size) {
+        g_free(d->readback_buf);
+        d->readback_buf = g_malloc(buf_size);
+        d->readback_buf_size = buf_size;
+    }
+
     d->frame_dirty = false;
     d->rendering = true;
 
     job = g_new0(AppleGFXRenderJob, 1);
     job->d = d;
     job->target = rvg_frame_target_retain(d->target);
-    job->width = surface_width(d->surface);
-    job->height = surface_height(d->surface);
+    job->width = width;
+    job->height = height;
+    job->pixels = d->readback_buf;
 
     thread_pool_submit_immediate(d->state->pool, apple_gfx_do_render, job,
                                  NULL);
@@ -164,18 +176,21 @@ static void apple_gfx_render_frame_completed_bh(void *opaque)
         job->width == surface_width(surface) &&
         job->height == surface_height(surface)) {
         size_t stride = (size_t)job->width * 4;
+        size_t dst_stride = surface_stride(surface);
         uint8_t *dst = surface_data(surface);
-        uint32_t y;
 
         /* The pixels have the surface's size and pixman's x8r8g8b8 layout. */
-        for (y = 0; y < job->height; y++) {
-            memcpy(dst + (size_t)y * surface_stride(surface),
-                   job->pixels + y * stride, stride);
+        if (dst_stride == stride) {
+            memcpy(dst, job->pixels, stride * job->height);
+        } else {
+            for (uint32_t y = 0; y < job->height; y++) {
+                memcpy(dst + (size_t)y * dst_stride,
+                       job->pixels + y * stride, stride);
+            }
         }
         dpy_gfx_update_full(d->con);
     }
     rvg_frame_target_release(job->target);
-    g_free(job->pixels);
     g_free(job);
 
     /*
@@ -218,8 +233,14 @@ static void apple_gfx_fb_update_display(void *opaque)
     AppleGFXDisplay *d = opaque;
 
     assert(bql_locked());
-    d->watched_until_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-                          APPLE_GFX_WATCH_MS;
+    /*
+     * Only arm continuous watching when a live DisplayChangeListener is
+     * attached; a headless one-shot QMP screendump renders just this frame.
+     */
+    if (qemu_console_is_visible(d->con)) {
+        d->watched_until_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                              APPLE_GFX_WATCH_MS;
+    }
     /*
      * QEMU 10.2's gfx_update has no return value: an asynchronous update
      * signals completion with graphic_hw_update_done(). Without a render
@@ -582,11 +603,10 @@ void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char *obj_name)
                           RVG_DEVICE_MMIO_SIZE);
     /*
      * An access needs no BQL (the accessors' comment), and the library takes
-     * accesses from several threads at once. Under KVM a vCPU makes the
-     * access without taking the BQL, and the reentrancy guard, which would
+     * accesses from several threads at once. Under KVM and TCG a vCPU makes
+     * the access without taking the BQL, and the reentrancy guard, which would
      * refuse a second vCPU's access while one is in the library, is off.
-     * HVF takes the BQL at every exit, and TCG for every access to I/O
-     * (cputlb.c), so under them the accesses stay one at a time.
+     * HVF takes the BQL at every exit, so under it accesses stay one at a time.
      */
     memory_region_enable_lockless_io(&s->iomem_gfx);
 
@@ -1134,6 +1154,10 @@ fail:
 
 void apple_gfx_common_finalize(AppleGFXState *s)
 {
+    for (uint32_t i = 0; i < RVG_MAX_DISPLAY_PORTS; i++) {
+        g_clear_pointer(&s->displays[i].readback_buf, g_free);
+        s->displays[i].readback_buf_size = 0;
+    }
     if (s->holds_activity) {
         s->holds_activity = false;
         apple_gfx_activity_end();
